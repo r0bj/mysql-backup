@@ -34,25 +34,30 @@ my $innobackupex = '/usr/bin/innobackupex';
 my $zabbix_sender = '/usr/bin/zabbix_sender';
 my $zabbix_agentd_conf = '/etc/zabbix/zabbix_agentd.conf';
 my $zabbix_key = 'mysql.backup';
+my $zabbix_key_duration = 'mysql.backup.duration';
 my $lock_file = '/var/run/mysql-backup.lock';
+my $my_cnf = ''; # if empty use default /etc/mysql/my.cnf
 
 my $backup_retention = 7; # days
 my $long_term_backups = 3; # items
 my $long_term_backup_day = '01';
 my $min_backups = 5; # minimum number of backups - do not remove backups if there are less than min_backups even if they are outdated
 my $max_backups = 30; # maximum number of backups without long term backups; 0 - unlimited
-
-my $lock_file_expired = 129600; # seconds
-my $now_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime);
-my $now_timestamp = time ();
-my $current_backup_dir = $backup_root . $now_str;
-my $hostname = hostname ();
-my $interactive = 0;
-my $initial_sleep = 1800;
 my $notify_zabbix = 1;
 my $compress = 2; # 0 - no compression; 1 - gzip; 2 - xz
 my $check_mountpoint = 0;
-my $my_cnf = '';
+my $lock_file_expired = 129600; # seconds
+my $initial_sleep = 1800; # seconds
+
+my $now_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime);
+my $current_backup_dir = $backup_root . $now_str;
+my $now_timestamp = time ();
+my $hostname = hostname ();
+
+my $creds = {
+#	'user' => 'innobackupex',
+#	'password' => 'xxx',
+};
 
 $SIG{'TERM'} = \&sig_handler;
 $SIG{'INT'} = \&sig_handler;
@@ -73,6 +78,22 @@ sub write_log {
 		printf (FILE "%s: %s\n", strftime ("%Y%m%d %H%M%S", localtime ()), $line);
 	}
 	close (FILE);
+}
+
+sub sec_to_human { 
+	my $time = shift; 
+	my $days = int($time / 86400); 
+	$time -= ($days * 86400); 
+	my $hours = int($time / 3600); 
+	$time -= ($hours * 3600); 
+	my $minutes = int($time / 60); 
+	my $seconds = $time % 60; 
+
+	$days = $days < 1 ? '' : $days .'d '; 
+	$hours = $hours < 1 ? '' : $hours .'h '; 
+	$minutes = $minutes < 1 ? '' : $minutes . 'm '; 
+	$time = $days . $hours . $minutes . $seconds . 's'; 
+	return ($time); 
 }
 
 sub check_mountpoint {
@@ -119,9 +140,11 @@ sub unlock {
 }
 
 sub notify_zabbix {
+	my $zabbix_key = shift;
 	my $value = shift;
 	my $output = `$zabbix_sender -c $zabbix_agentd_conf -s $hostname -k $zabbix_key -o $value 2>&1`;
-	write_log ('zabbix_sender:' . $output);
+	$output =~ s/\n/ /g;
+	write_log ("INFO: zabbix key: $zabbix_key, zabbix_sender: " . $output);
 }
 
 sub get_items_from_backup_root {
@@ -130,7 +153,7 @@ sub get_items_from_backup_root {
 
 	opendir (my $dh, $backup_root);
 	while (readdir $dh) {
-		# gzip or xz compress
+		# compressed
 		if (/^((\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.tar.(?:gz|xz))/) {
 			my ($year, $mon, $mday, $hour, $min, $sec) = ($2, $3, $4, $5, $6, $7);
 			$mon -= 1;
@@ -217,7 +240,7 @@ sub rm_backups {
 				defined ($items->{$item}->{'force_delete'})) {
 
 				write_log ("INFO: deleting old backup $item");
-				# compressed archives
+				# compressed backups
 				if ($items->{$item}->{'type'} eq 'file') {
 					if (system ("rm -f ${backup_root}${item} 2>&1 >>$log_file") != 0) {
 						write_log ("ERROR: cannot delete old backup $item");
@@ -247,7 +270,7 @@ sub rm_long_term_backups {
 		if (defined ($items->{$item}->{'long_term_backup'})) {
 			if (!defined ($items->{$item}->{'current'}) && $ctr > $long_term_backups) {
 				write_log ("INFO: deleting old long term backup $item");
-				# compressed archives
+				# compressed backups
 				if ($items->{$item}->{'type'} eq 'file') {
 					if (system ("rm -f ${backup_root}${item} 2>&1 >>$log_file") != 0) {
 						write_log ("ERROR: cannot delete old backup $item");
@@ -289,33 +312,20 @@ sub init_sleep {
 	sleep (int (rand ($range)));
 }
 
-sub get_mysql_credentials {
-	my $debian_cnf = shift;
-	my $conf;
-	my $bracket;
-
-	open (FILE, "<$debian_cnf");
-	while (<FILE>) {
-		$bracket = $1 if /^\[(.*)\]/;
-		$conf->{$bracket}->{'user'} = $1 if /^user\s+=\s+([a-zA-Z0-9\._-]+)/;
-		$conf->{$bracket}->{'password'} = $1 if /^password\s+=\s+([a-zA-Z0-9\._-]+)/;
-	}
-	close (FILE);
-
-	if (defined $conf->{'client'}->{'user'} && defined $conf->{'client'}->{'password'}) {
-		my $creds;
-		$creds->{'user'} = $conf->{'client'}->{'user'};
-		$creds->{'password'} = $conf->{'client'}->{'password'};
-		return ($creds);
-	}
-	return (undef);
-}
-
 sub make_xtrabackup {
 	my $creds = shift;
+	my $cmd;
+	my $output;
+	my $opts = ($my_cnf ? "--defaults-file=$my_cnf " : '') . "--no-timestamp $current_backup_dir 2>&1 | tee -a $log_file";
 
-	my $cmd = "$innobackupex --user=$creds->{'user'} --password=$creds->{'password'} " . ($my_cnf ? "--defaults-file=$my_cnf " : '') . "--no-timestamp $current_backup_dir 2>&1 | tee -a $log_file";
-	my $output = `$cmd`;
+	if ($debian_cnf) {
+		$cmd = "$innobackupex --defaults-extra-file=$debian_cnf " . $opts;
+		$output = `$cmd`;
+	}
+	else {
+		$cmd = "$innobackupex --user=$creds->{'user'} --password=$creds->{'password'} " . $opts;
+		$output = `$cmd`;
+	}
 
 	if ($output =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+innobackupex: completed OK!/) {
 		if ($compress) {
@@ -324,31 +334,35 @@ sub make_xtrabackup {
 			if (system ($cmd) == 0) {
 				write_log ("INFO: commpression ok, deleting current backup dir $current_backup_dir");
 				if (system ("rm -rf $current_backup_dir 2>&1 >>$log_file") == 0) {
-					#notify_zabbix (SUCCESS) if ($notify_zabbix);
 					if (delete_old_backups ($backup_root, $backup_retention, $long_term_backups)) {
-						notify_zabbix (SUCCESS) if ($notify_zabbix);
+						notify_zabbix ($zabbix_key, SUCCESS) if ($notify_zabbix);
+						my $duration = time () - $now_timestamp;
+						notify_zabbix ($zabbix_key_duration, $duration) if ($notify_zabbix);
+						write_log ('INFO: backup duration: '.sec_to_human ($duration));
 					}
 					else {
-						notify_zabbix (FAIL) if ($notify_zabbix);
+						notify_zabbix ($zabbix_key, FAIL) if ($notify_zabbix);
 					}
 				}
 				else {
 					write_log ("ERROR: cannot delete $current_backup_dir");
-					notify_zabbix (FAIL) if ($notify_zabbix);
+					notify_zabbix ($zabbix_key, FAIL) if ($notify_zabbix);
 				}
 			}
 			else {
 				write_log ("ERROR: cannot compress $current_backup_dir");
-				notify_zabbix (FAIL) if ($notify_zabbix);
+				notify_zabbix ($zabbix_key, FAIL) if ($notify_zabbix);
 			}
 		}
 		else {
-			notify_zabbix (SUCCESS) if ($notify_zabbix);
 			if (delete_old_backups ($backup_root, $backup_retention, $long_term_backups)) {
-				notify_zabbix (SUCCESS) if ($notify_zabbix);
+				notify_zabbix ($zabbix_key, SUCCESS) if ($notify_zabbix);
+				my $duration = time () - $now_timestamp;
+				notify_zabbix ($zabbix_key_duration, $duration) if ($notify_zabbix);
+				write_log ('INFO: backup duration: '.sec_to_human ($duration));
 			}
 			else {
-				notify_zabbix (FAIL) if ($notify_zabbix);
+				notify_zabbix ($zabbix_key, FAIL) if ($notify_zabbix);
 			}
 		}
 	}
@@ -357,7 +371,7 @@ sub make_xtrabackup {
 		if (system ("rm -rf $current_backup_dir 2>&1 >>$log_file") != 0) {
 			write_log ("ERROR: cannot delete failed backup dir $current_backup_dir");
 		}
-		notify_zabbix (FAIL) if ($notify_zabbix);
+		notify_zabbix ($zabbix_key, FAIL) if ($notify_zabbix);
 	}
 }
 
@@ -378,22 +392,29 @@ if (! -e $innobackupex) {
 	exit;
 }
 
+if ($notify_zabbix && (! -e $zabbix_sender || ! -e $zabbix_agentd_conf)) {
+	write_log ("ERROR: zabbix_sender $zabbix_sender or zabbix_agentd.conf $zabbix_agentd_conf does not exists");
+	exit;
+}
+
 if ($min_backups >= $max_backups) {
 	write_log ("ERROR: min_backups >= max_backups");
 	exit;
 }
 
-my $creds = get_mysql_credentials ($debian_cnf);
-
-if (!defined $creds->{'user'} || !defined $creds->{'password'}) {
+if (!length ($debian_cnf) && (!exists ($creds->{'user'}) || !exists ($creds->{'password'}))) {
 	write_log ('ERROR: cannot find valid mysql credentials');
 	exit;
+}
+
+# short hostname
+if ($hostname =~ /^([^\.]+)\./) {
+	$hostname = $1;
 }
 
 lock ();
 
 if (-t 1) {
-	$interactive = 1;
 	write_log ("INFO: interactive executing");
 }
 else {
