@@ -45,6 +45,7 @@ my $min_backups = 5; # minimum number of backups - do not remove backups if ther
 my $max_backups = 30; # maximum number of backups without long term backups; 0 - unlimited
 my $notify_zabbix = 1;
 my $compress = 2; # 0 - no compression; 1 - gzip; 2 - xz
+my $compress_qpress = 0; # internal xtrabackup compression
 my $check_mountpoint = 0;
 my $lock_file_expired = 129600; # seconds
 my $initial_sleep = 1800; # seconds
@@ -316,7 +317,7 @@ sub make_xtrabackup {
 	my $creds = shift;
 	my $cmd;
 	my $output;
-	my $opts = ($my_cnf ? "--defaults-file=$my_cnf " : '') . "--no-timestamp $current_backup_dir 2>&1 | tee -a $log_file";
+	my $opts = ($my_cnf ? "--defaults-file=$my_cnf " : '') . ($compress_qpress ? "--compress " : '') . "--no-timestamp $current_backup_dir 2>&1 | tee -a $log_file";
 
 	if ($debian_cnf) {
 		$cmd = "$innobackupex --defaults-extra-file=$debian_cnf " . $opts;
