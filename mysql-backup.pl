@@ -330,10 +330,10 @@ sub make_xtrabackup {
 
 	if ($output =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+innobackupex: completed OK!/) {
 		if ($compress) {
-			write_log ("INFO: starting $current_backup_dir commpression");
-			my $cmd = "tar " . (($compress == 2) ? "cvpJf ${current_backup_dir}.tar.xz" : "cvpzf ${current_backup_dir}.tar.gz") . " -C $backup_root $now_str 2>&1 >>$log_file";
+			write_log ("INFO: starting $current_backup_dir compression");
+			my $cmd = "ionice -c2 -n7 nice -n19 tar " . (($compress == 2) ? "cvpJf ${current_backup_dir}.tar.xz" : "cvpzf ${current_backup_dir}.tar.gz") . " -C $backup_root $now_str 2>&1 >>$log_file";
 			if (system ($cmd) == 0) {
-				write_log ("INFO: commpression ok, deleting current backup dir $current_backup_dir");
+				write_log ("INFO: compression ok, deleting current backup dir $current_backup_dir");
 				if (system ("rm -rf $current_backup_dir 2>&1 >>$log_file") == 0) {
 					if (delete_old_backups ($backup_root, $backup_retention, $long_term_backups)) {
 						notify_zabbix ($zabbix_key, SUCCESS) if ($notify_zabbix);
