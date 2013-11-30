@@ -32,7 +32,8 @@ my $debian_cnf = '/etc/mysql/debian.cnf';
 my $backup_root = '/var/mysql-backup/';
 my $innobackupex = '/usr/bin/innobackupex';
 my $zabbix_sender = '/usr/bin/zabbix_sender';
-my $zabbix_agentd_conf = '/etc/zabbix/zabbix_agentd.conf';
+my $zabbix_agentd_conf = '/etc/zabbix/zabbix_agentd.conf'; # discarded if zabbix_server defined
+my $zabbix_server = ''; # if set zabbix_agentd_conf is discarded
 my $zabbix_key = 'mysql.backup';
 my $zabbix_key_duration = 'mysql.backup.duration';
 my $lock_file = '/var/run/mysql-backup.lock';
@@ -143,7 +144,13 @@ sub unlock {
 sub notify_zabbix {
 	my $zabbix_key = shift;
 	my $value = shift;
-	my $output = `$zabbix_sender -c $zabbix_agentd_conf -s $hostname -k $zabbix_key -o $value 2>&1`;
+	my $output;
+	if (length ($zabbix_server)) {
+		$output = `$zabbix_sender -z $zabbix_server -s $hostname -k $zabbix_key -o $value 2>&1`;
+	}
+	else {
+		$output = `$zabbix_sender -c $zabbix_agentd_conf -s $hostname -k $zabbix_key -o $value 2>&1`;
+	}
 	$output =~ s/\n/ /g;
 	write_log ("INFO: zabbix key: $zabbix_key, zabbix_sender: " . $output);
 }
@@ -331,7 +338,7 @@ sub make_xtrabackup {
 	if ($output =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+innobackupex: completed OK!/) {
 		if ($compress) {
 			write_log ("INFO: starting $current_backup_dir compression");
-			my $cmd = "ionice -c2 -n7 nice -n19 tar " . (($compress == 2) ? "cvpJf ${current_backup_dir}.tar.xz" : "cvpzf ${current_backup_dir}.tar.gz") . " -C $backup_root $now_str 2>&1 >>$log_file";
+			my $cmd = "tar " . (($compress == 2) ? "cvpJf ${current_backup_dir}.tar.xz" : "cvpzf ${current_backup_dir}.tar.gz") . " -C $backup_root $now_str 2>&1 >>$log_file";
 			if (system ($cmd) == 0) {
 				write_log ("INFO: compression ok, deleting current backup dir $current_backup_dir");
 				if (system ("rm -rf $current_backup_dir 2>&1 >>$log_file") == 0) {
@@ -378,6 +385,11 @@ sub make_xtrabackup {
 
 ## MAIN
 
+if ($> != 0) {
+	print ("ERROR: you must be root to run this program\n");
+	exit;
+}
+
 if (! -d $backup_root) {
 	write_log ("ERROR: backup root directory $backup_root does not exists");
 	exit;
@@ -393,8 +405,13 @@ if (! -e $innobackupex) {
 	exit;
 }
 
-if ($notify_zabbix && (! -e $zabbix_sender || ! -e $zabbix_agentd_conf)) {
-	write_log ("ERROR: zabbix_sender $zabbix_sender or zabbix_agentd.conf $zabbix_agentd_conf does not exists");
+if ($notify_zabbix && (!length ($zabbix_server) && ! -e $zabbix_agentd_conf)) {
+	write_log ("ERROR: zabbix_server not defined and zabbix_agentd_conf does not exists");
+	exit;
+}
+
+if ($notify_zabbix && (! -e $zabbix_sender)) {
+	write_log ("ERROR: zabbix_sender $zabbix_sender does not exists");
 	exit;
 }
 
