@@ -21,6 +21,7 @@ use POSIX 'strftime';
 use Sys::Hostname;
 use File::stat;
 use Time::Local;
+use Config::Simple;
 
 use constant {
 	SUCCESS => '1',
@@ -28,7 +29,7 @@ use constant {
 };
 
 my $log_file = '/var/log/mysql-backup.log';
-my $debian_cnf = '/etc/mysql/debian.cnf';
+my $client_auth_file = '/etc/mysql/debian.cnf';
 my $backup_root = '/var/mysql-backup/';
 my $innobackupex = '/usr/bin/innobackupex';
 my $zabbix_sender = '/usr/bin/zabbix_sender';
@@ -38,6 +39,8 @@ my $zabbix_key = 'mysql.backup';
 my $zabbix_key_duration = 'mysql.backup.duration';
 my $lock_file = '/var/run/mysql-backup.lock';
 my $my_cnf = ''; # if empty use default /etc/mysql/my.cnf
+my $mysql_user = '';
+my $mysql_passwd = '';
 
 my $backup_retention = 7; # days
 my $long_term_backups = 3; # items
@@ -52,14 +55,9 @@ my $lock_file_expired = 129600; # seconds
 my $initial_sleep = 1800; # seconds
 
 my $now_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime);
-my $current_backup_dir = $backup_root . $now_str;
+my $current_backup_dir;
 my $now_timestamp = time ();
 my $hostname = hostname ();
-
-my $creds = {
-#	'user' => 'innobackupex',
-#	'password' => 'xxx',
-};
 
 $SIG{'TERM'} = \&sig_handler;
 $SIG{'INT'} = \&sig_handler;
@@ -321,17 +319,16 @@ sub init_sleep {
 }
 
 sub make_xtrabackup {
-	my $creds = shift;
 	my $cmd;
 	my $output;
 	my $opts = ($my_cnf ? "--defaults-file=$my_cnf " : '') . ($compress_qpress ? "--compress " : '') . "--no-timestamp $current_backup_dir 2>&1 | tee -a $log_file";
 
-	if ($debian_cnf) {
-		$cmd = "$innobackupex --defaults-extra-file=$debian_cnf " . $opts;
+	if ($client_auth_file) {
+		$cmd = "$innobackupex --defaults-extra-file=$client_auth_file " . $opts;
 		$output = `$cmd`;
 	}
 	else {
-		$cmd = "$innobackupex --user=$creds->{'user'} --password=$creds->{'password'} " . $opts;
+		$cmd = "$innobackupex --user=$mysql_user --password=$mysql_passwd " . $opts;
 		$output = `$cmd`;
 	}
 
@@ -383,7 +380,57 @@ sub make_xtrabackup {
 	}
 }
 
+sub parse_config {
+	my $cnf_file;
+	if (-e '/etc/backups/mysql-backup.conf') {
+		$cnf_file = '/etc/backups/mysql-backup.conf';
+	}
+	elsif (-e '/matrix/mysql-backup.conf') {
+		$cnf_file = '/matrix/mysql-backup.conf';
+	}
+	elsif (-e '~/.mysql-backup') {
+		$cnf_file = '~/.mysql-backup';
+	}
+	else {
+		return;
+	}
+
+	my $cfg = new Config::Simple ($cnf_file);
+	if (!$cfg) {
+		return;
+	}
+
+	$log_file = $cfg->param ('log_file') if (defined $cfg->param ('log_file'));
+	$client_auth_file = $cfg->param ('client_auth_file') if (defined $cfg->param ('client_auth_file'));
+	$backup_root = $cfg->param ('backup_root') if (defined $cfg->param ('backup_root'));
+	$innobackupex = $cfg->param ('innobackupex') if (defined $cfg->param ('innobackupex'));
+	$zabbix_sender = $cfg->param ('zabbix_sender') if (defined $cfg->param ('zabbix_sender'));
+	$zabbix_agentd_conf = $cfg->param ('zabbix_agentd_conf') if (defined $cfg->param ('zabbix_agentd_conf'));
+	$zabbix_server = $cfg->param ('zabbix_server') if (defined $cfg->param ('zabbix_server'));
+	$zabbix_key = $cfg->param ('zabbix_key') if (defined $cfg->param ('zabbix_key'));
+	$zabbix_key_duration = $cfg->param ('zabbix_key_duration') if (defined $cfg->param ('zabbix_key_duration'));
+	$lock_file = $cfg->param ('lock_file') if (defined $cfg->param ('lock_file'));
+	$my_cnf = $cfg->param ('my_cnf') if (defined $cfg->param ('my_cnf'));
+	$mysql_user = $cfg->param ('mysql_user') if (defined $cfg->param ('mysql_user'));
+	$mysql_passwd = $cfg->param ('mysql_passwd') if (defined $cfg->param ('mysql_passwd'));
+
+	$backup_retention = $cfg->param ('backup_retention') if (defined $cfg->param ('backup_retention'));
+	$long_term_backups = $cfg->param ('long_term_backups') if (defined $cfg->param ('long_term_backups'));
+	$long_term_backup_day = $cfg->param ('long_term_backup_day') if (defined $cfg->param ('long_term_backup_day'));
+	$min_backups = $cfg->param ('min_backups') if (defined $cfg->param ('min_backups'));
+	$max_backups = $cfg->param ('max_backups') if (defined $cfg->param ('max_backups'));
+	$notify_zabbix = $cfg->param ('notify_zabbix') if (defined $cfg->param ('notify_zabbix'));
+	$compress = $cfg->param ('compress') if (defined $cfg->param ('compress'));
+	$compress_qpress = $cfg->param ('compress_qpress') if (defined $cfg->param ('compress_qpress'));
+	$check_mountpoint = $cfg->param ('check_mountpoint') if (defined $cfg->param ('check_mountpoint'));
+	$lock_file_expired = $cfg->param ('lock_file_expired') if (defined $cfg->param ('lock_file_expired'));
+	$initial_sleep = $cfg->param ('initial_sleep') if (defined $cfg->param ('initial_sleep'));
+}
+
 ## MAIN
+
+parse_config ();
+$current_backup_dir = $backup_root . $now_str;
 
 if ($> != 0) {
 	print ("ERROR: you must be root to run this program\n");
@@ -420,7 +467,7 @@ if ($min_backups >= $max_backups) {
 	exit;
 }
 
-if (!length ($debian_cnf) && (!exists ($creds->{'user'}) || !exists ($creds->{'password'}))) {
+if (!length ($client_auth_file) && (!length ($mysql_user) || !length ($mysql_passwd))) {
 	write_log ('ERROR: cannot find valid mysql credentials');
 	exit;
 }
@@ -439,6 +486,6 @@ else {
 	init_sleep ($initial_sleep);
 }
 
-make_xtrabackup ($creds);
+make_xtrabackup ();
 
 unlock ();
