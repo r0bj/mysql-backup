@@ -49,7 +49,7 @@ my %conf = (
 	'min_backups' => 5, # minimum number of backups - do not remove backups if there are less than min_backups even if they are outdated
 	'max_backups' => 30, # maximum number of backups without long term backups; 0 - unlimited
 	'notify_zabbix' => 1,
-	'compress' => 4, # 0 - no compression; 1 - qpress (internal xtrabackup compression); 2 - gzip; 3 - bzip2; 4 - xz
+	'compress' => 0, # 0 - no compression; 1 - qpress (internal xtrabackup compression); 2 - gzip; 3 - bzip2; 4 - xz
 	'check_mountpoint' => 0,
 	'lock_file_expired' => 129600, # seconds
 	'initial_sleep' => 1800, # seconds
@@ -66,6 +66,7 @@ $SIG{'INT'} = \&sig_handler;
 sub sig_handler {
 	write_log ('TERM/INT signal caught, exiting');
 	cleanup ();
+	unlink ($tmp_logfile);
 	unlock ();
 	exit 1;
 }
@@ -254,7 +255,6 @@ sub rm_backups {
 				write_log ("INFO: deleting old backup $item");
 				# compressed backups
 				if ($items->{$item}->{'type'} eq 'file') {
-					#if (system ("rm -f ${backup_root}${item} 2>&1 >>$conf{'logfile'}") != 0) {
 					if (system ("rm -f $conf{'backup_root'}${item} 2>&1 >>$conf{'logfile'}") != 0) {
 						write_log ("ERROR: cannot delete old backup $item");
 						return (undef);
@@ -262,7 +262,6 @@ sub rm_backups {
 				}
 				# uncompressed backups
 				elsif ($items->{$item}->{'type'} eq 'dir') {
-					#if (system ("rm -rf ${backup_root}${item} 2>&1 >>$conf{'logfile'}") != 0) {
 					if (system ("rm -rf $conf{'backup_root'}${item} 2>&1 >>$conf{'logfile'}") != 0) {
 						write_log ("ERROR: cannot delete old backup $item");
 						return (undef);
@@ -286,7 +285,6 @@ sub rm_long_term_backups {
 				write_log ("INFO: deleting old long term backup $item");
 				# compressed backups
 				if ($items->{$item}->{'type'} eq 'file') {
-					#if (system ("rm -f ${backup_root}${item} 2>&1 >>$conf{'logfile'}") != 0) {
 					if (system ("rm -f $conf{'backup_root'}${item} 2>&1 >>$conf{'logfile'}") != 0) {
 						write_log ("ERROR: cannot delete old backup $item");
 						return (undef);
@@ -294,7 +292,6 @@ sub rm_long_term_backups {
 				}
 				# uncompressed backups
 				elsif ($items->{$item}->{'type'} eq 'dir') {
-					#if (system ("rm -rf ${backup_root}${item} 2>&1 >>$conf{'logfile'}") != 0) {
 					if (system ("rm -rf $conf{'backup_root'}${item} 2>&1 >>$conf{'logfile'}") != 0) {
 						write_log ("ERROR: cannot delete old backup $item");
 						return (undef);
@@ -419,26 +416,6 @@ sub parse_config {
 
 parse_config ();
 
-if ($> != 0) {
-	print ("ERROR: you must be root to run this program\n");
-	exit 1;
-}
-
-if (! -d $conf{'backup_root'}) {
-	write_log ("ERROR: backup root directory $conf{'backup_root'} does not exists");
-	exit 1;
-}
-
-if ($conf{'check_mountpoint'} && !check_mountpoint ($conf{'backup_root'})) {
-	write_log ("ERROR: mount point for $conf{'backup_root'} does not exists");
-	exit 1;
-}
-
-if (! -e $conf{'innobackupex'}) {
-	write_log ("ERROR: $conf{'innobackupex'} does not exists");
-	exit 1;
-}
-
 if ($conf{'notify_zabbix'} && (!length ($conf{'zabbix_server'}) && ! -e $conf{'zabbix_agentd_conf'})) {
 	write_log ("ERROR: zabbix_server not defined and zabbix_agentd_conf does not exists");
 	exit 1;
@@ -449,13 +426,39 @@ if ($conf{'notify_zabbix'} && (! -e $conf{'zabbix_sender'})) {
 	exit 1;
 }
 
+if ($> != 0) {
+	print ("ERROR: you must be root to run this program\n");
+	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	exit 1;
+}
+
+if (! -e $conf{'innobackupex'}) {
+	write_log ("ERROR: $conf{'innobackupex'} does not exists");
+	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	exit 1;
+}
+
+if (! -d $conf{'backup_root'}) {
+	write_log ("ERROR: backup root directory $conf{'backup_root'} does not exists");
+	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	exit 1;
+}
+
+if ($conf{'check_mountpoint'} && !check_mountpoint ($conf{'backup_root'})) {
+	write_log ("ERROR: mount point for $conf{'backup_root'} does not exists");
+	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	exit 1;
+}
+
 if ($conf{'min_backups'} >= $conf{'max_backups'}) {
 	write_log ("ERROR: min_backups >= max_backups");
+	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
 	exit 1;
 }
 
 if (!length ($conf{'client_auth_file'}) && (!length ($conf{'mysql_user'}) || !length ($conf{'mysql_passwd'}))) {
 	write_log ('ERROR: cannot find valid mysql credentials');
+	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
 	exit 1;
 }
 
