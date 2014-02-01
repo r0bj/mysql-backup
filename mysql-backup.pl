@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-# Copyright (c) 2012-2013 Robert Jerzak
+# Copyright (c) 2012-2014 Robert Jerzak
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -14,6 +14,11 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Requirements for compression in no-stream mode:
+# - lbzip2 (parallel bzip2)
+# - pigz (parallel gzip)
+# - pixz (parallel xz)
 
 use strict;
 use warnings;
@@ -53,10 +58,14 @@ my %conf = (
 	'check_mountpoint' => 0,
 	'lock_file_expired' => 129600, # seconds
 	'initial_sleep' => 1800, # seconds
+
+	'parallel' => 1, # number of threads to use for parallel datafiles transfer, does not have any effect in the stream mode.
+	'compress-threads' => 1, # number of threads for parallel data compression (qpress)
+	'stream' => 0, # 0 - no stream, better suitable for local backup, 1 - stream compression, better suitable for remote (eg. sshfs) backups
 );
 
-my $now_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime);
-my $now_timestamp = time ();
+my $timestamp_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime);
+my $start_timestamp = time ();
 my $hostname = hostname ();
 my ($tmpfile_fh, $tmp_logfile) = mkstemp ('/tmp/mysql-backup.XXXXXX');
 
@@ -166,30 +175,17 @@ sub get_items_from_backup_root {
 
 	opendir (my $dh, $backup_root);
 	while (readdir $dh) {
-		# compressed
-		if (/^((\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.tar.(?:gz|bz2|xz))/) {
+		if (/^((\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})(\.tar\.(?:gz|bz2|xz))?)/) {
 			my ($year, $mon, $mday, $hour, $min, $sec) = ($2, $3, $4, $5, $6, $7);
-			$mon -= 1;
-			my $time = timelocal ($sec, $min, $hour, $mday, $mon, $year);
+			my $time = timelocal ($sec, $min, $hour, $mday, $mon - 1, $year);
+			my $type = length $8 ? 'file' : 'dir';
+
 			$items->{$1} = {
 				'timestamp' => $time,
-				'type' => 'file',
+				'type' => $type,
 			};
 			if ($mday == $conf{'long_term_backup_day'}) {
-				$items->{$1}->{'long_term_backup'} = $year . sprintf ("%.2d", $mon + 1);
-			}
-		}
-		# uncompressed
-		elsif (/^((\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2}))/) {
-			my ($year, $mon, $mday, $hour, $min, $sec) = ($2, $3, $4, $5, $6, $7);
-			$mon -= 1;
-			my $time = timelocal ($sec, $min, $hour, $mday, $mon, $year);
-			$items->{$1} = {
-				'timestamp' => $time,
-				'type' => 'dir',
-			};
-			if ($mday == $conf{'long_term_backup_day'}) {
-				$items->{$1}->{'long_term_backup'} = $year . sprintf ("%.2d", $mon + 1);
+				$items->{$1}->{'long_term_backup'} = $year . sprintf ("%.2d", $mon);
 			}
 		}
 	}
@@ -205,7 +201,7 @@ sub mark_items {
 	# mark backups as "do not delete" due to "store minimum number of backups"
 	my $ctr = 1;
 	foreach my $item (sort { $items->{$b}->{'timestamp'} <=> $items->{$a}->{'timestamp'} } keys ($items)) {
-		if ($item =~ /^$now_str/) {
+		if ($item =~ /^$timestamp_str/) {
 			$items->{$item}->{'current'} = 1;
 		} 
 		if ($ctr <= $conf{'min_backups'}) {
@@ -248,7 +244,7 @@ sub rm_backups {
 	foreach my $item (keys %$items) {
 		if (!defined ($items->{$item}->{'long_term_backup'})) {
 			if (($items->{$item}->{'timestamp'} =~ /^\d+$/ &&
-				$now_timestamp - $items->{$item}->{'timestamp'} > 86400 * $days &&
+				$start_timestamp - $items->{$item}->{'timestamp'} > 86400 * $days &&
 				!defined ($items->{$item}->{'do_not_delete'})) ||
 				defined ($items->{$item}->{'force_delete'})) {
 
@@ -330,9 +326,13 @@ sub make_xtrabackup {
 	my $cmd;
 	my $output;
 	my $backup_product;
-	my $opts = ($conf{'my_cnf'} ? "--defaults-file=$conf{'my_cnf'} " : '');
+	my $opts = $conf{'client_auth_file'} ? "--defaults-extra-file=$conf{'client_auth_file'} " : "--user=$conf{'mysql_user'} --password=$conf{'mysql_passwd'} ";
 
-	if ($conf{'compress'} == 0) {
+	$opts = $opts . ($conf{'parallel'} != 1 ? "--parallel=$conf{'parallel'} " : '') .
+		($conf{'compress-threads'} != 1 ? "--compress-threads=$conf{'compress-threads'} " : '') .
+		($conf{'my_cnf'} ? "--defaults-file=$conf{'my_cnf'} " : '');
+
+	if ($conf{'compress'} == 0 || ($conf{'stream'} == 0 && $conf{'compress'} > 1)) {
 		$backup_product = $current_backup_dir;
 		$opts = $opts . "--no-timestamp $backup_product 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null)";
 	}
@@ -340,44 +340,86 @@ sub make_xtrabackup {
 		$backup_product = $current_backup_dir;
 		$opts = $opts . "--compress --no-timestamp $backup_product 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null)";
 	}
-	elsif ($conf{'compress'} == 2) {
+	elsif ($conf{'compress'} == 2 && $conf{'stream'}) {
 		$backup_product = "${current_backup_dir}.tar.gz";
 		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | gzip - > $backup_product";
 	}
-	elsif ($conf{'compress'} == 3) {
+	elsif ($conf{'compress'} == 3 && $conf{'stream'}) {
 		$backup_product = "${current_backup_dir}.tar.bz2";
 		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | bzip2 - > $backup_product";
 	}
-	elsif ($conf{'compress'} == 4) {
+	elsif ($conf{'compress'} == 4 && $conf{'stream'}) {
 		$backup_product = "${current_backup_dir}.tar.xz";
 		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | xz - > $backup_product";
 	}
 	else {
 		write_log ("ERROR: wrong compress method");
-		return;
+		return undef;
 	}
 
-	if ($conf{'client_auth_file'}) {
-		$cmd = "$conf{'innobackupex'} --defaults-extra-file=$conf{'client_auth_file'} " . $opts;
-	}
-	else {
-		$cmd = "$conf{'innobackupex'} --user=$conf{'mysql_user'} --password=$conf{'mysql_passwd'} " . $opts;
-	}
+	$cmd = "$conf{'innobackupex'} " . $opts;
 
-	# to execute bash not default sh
+	my $cmd_sec = $cmd;
+	$cmd_sec =~ s/\s--password=\S+\s/ --password=XXX /;
+	write_log ("INFO: backup command: $cmd_sec");
+	
+	# to execute bash instead of default sh
 	system ("bash -c '$cmd'");
 
 	my $result = join '', <$tmpfile_fh>;
 	if ($result =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+innobackupex: completed OK!/) {
-		#if (delete_old_backups ($backup_root, $backup_retention, $long_term_backups)) {
-		if (delete_old_backups ($conf{'backup_root'}, $conf{'backup_retention'}, $conf{'long_term_backups'})) {
-			notify_zabbix ($conf{'zabbix_key'}, SUCCESS) if ($conf{'notify_zabbix'});
-			my $duration = time () - $now_timestamp;
-			notify_zabbix ($conf{'zabbix_key_duration'}, $duration) if ($conf{'notify_zabbix'});
-			write_log ('INFO: backup duration: '.sec_to_human ($duration));
+		if ($conf{'stream'} == 0 && $conf{'compress'} > 1) {
+			my $taropts;
+			if ($conf{'compress'} == 2) {
+				$taropts = "cvpf ${current_backup_dir}.tar.gz -I pigz "
+			}
+			elsif ($conf{'compress'} == 3) {
+				$taropts = "cvpf ${current_backup_dir}.tar.bz2 -I lbzip2 "
+			}
+			elsif ($conf{'compress'} == 4) {
+				$taropts = "cvpf ${current_backup_dir}.tar.xz -I pixz "
+			}
+			else {
+				write_log ("ERROR: wrong compress method");
+				return undef;
+			}
+			my $tarcmd = 'tar ' . $taropts . "-C $conf{'backup_root'} $timestamp_str 2>&1 >>$conf{'logfile'}";
+			write_log ("INFO: starting compression $current_backup_dir, command: $tarcmd");
+
+			if (system ($tarcmd) == 0) {
+				write_log ("INFO: compression ok, deleting current backup dir $current_backup_dir");
+				if (system ("rm -rf $current_backup_dir 2>&1 >>$conf{'logfile'}") == 0) {
+					if (delete_old_backups ($conf{'backup_root'}, $conf{'backup_retention'}, $conf{'long_term_backups'})) {
+						notify_zabbix ($conf{'zabbix_key'}, SUCCESS) if ($conf{'notify_zabbix'});
+						my $duration = time () - $start_timestamp;
+						notify_zabbix ($conf{'zabbix_key_duration'}, $duration) if ($conf{'notify_zabbix'});
+						write_log ('INFO: backup duration: '.sec_to_human ($duration));
+					}
+					else {
+						notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+					}
+				}
+				else {
+					write_log ("ERROR: cannot delete $current_backup_dir");
+					notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+				}
+			}
+			else {
+				write_log ("ERROR: cannot compress $current_backup_dir");
+				notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+			}
+
 		}
 		else {
-			notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+			if (delete_old_backups ($conf{'backup_root'}, $conf{'backup_retention'}, $conf{'long_term_backups'})) {
+				notify_zabbix ($conf{'zabbix_key'}, SUCCESS) if ($conf{'notify_zabbix'});
+				my $duration = time () - $start_timestamp;
+				notify_zabbix ($conf{'zabbix_key_duration'}, $duration) if ($conf{'notify_zabbix'});
+				write_log ('INFO: backup duration: '.sec_to_human ($duration));
+			}
+			else {
+				notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+			}
 		}
 	}
 	else {
@@ -470,13 +512,14 @@ if ($hostname =~ /^([^\.]+)\./) {
 lock ();
 
 if (-t 1) {
-	write_log ("INFO: interactive executing");
+	write_log ("INFO: backup start, interactive executing");
 }
 else {
 	init_sleep ($conf{'initial_sleep'});
+	write_log ("INFO: backup start");
 }
 
-make_xtrabackup ($conf{'backup_root'}.$now_str);
+make_xtrabackup ($conf{'backup_root'}.$timestamp_str);
 
 cleanup ();
 unlock ();
