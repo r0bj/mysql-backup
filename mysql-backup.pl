@@ -64,8 +64,8 @@ my %conf = (
 	'stream' => 1, # 0 - no stream compression, better suitable for local backup, 1 - stream compression, local and remote (eg. sshfs) backups
 );
 
-my $timestamp_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime);
-my $start_timestamp = time ();
+my $start_timestamp_str;
+my $start_timestamp;
 my $hostname = hostname ();
 my ($tmpfile_fh, $tmp_logfile) = mkstemp ('/tmp/mysql-backup.XXXXXX');
 
@@ -201,7 +201,7 @@ sub mark_items {
 	# mark backups as "do not delete" due to "store minimum number of backups"
 	my $ctr = 1;
 	foreach my $item (sort { $items->{$b}->{'timestamp'} <=> $items->{$a}->{'timestamp'} } keys ($items)) {
-		if ($item =~ /^$timestamp_str/) {
+		if ($item =~ /^$start_timestamp_str/) {
 			$items->{$item}->{'current'} = 1;
 		} 
 		if ($ctr <= $conf{'min_backups'}) {
@@ -383,7 +383,7 @@ sub make_xtrabackup {
 				write_log ("ERROR: wrong compress method");
 				return undef;
 			}
-			my $tarcmd = 'tar ' . $taropts . "-C $conf{'backup_root'} $timestamp_str 2>&1 >>$conf{'logfile'}";
+			my $tarcmd = 'tar ' . $taropts . "-C $conf{'backup_root'} $start_timestamp_str 2>&1 >>$conf{'logfile'}";
 			write_log ("INFO: starting compression $current_backup_dir, command: $tarcmd");
 
 			if (system ($tarcmd) == 0) {
@@ -519,7 +519,9 @@ else {
 	write_log ("INFO: backup start");
 }
 
-make_xtrabackup ($conf{'backup_root'}.$timestamp_str);
+$start_timestamp = time ();
+$start_timestamp_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime ($start_timestamp));
+make_xtrabackup ($conf{'backup_root'}.$start_timestamp_str);
 
 cleanup ();
 unlock ();
