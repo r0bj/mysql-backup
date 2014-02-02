@@ -15,10 +15,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-# Requirements for compression in no-stream mode:
+# Requirements for compression:
 # - lbzip2 (parallel bzip2)
 # - pigz (parallel gzip)
-# - pixz (parallel xz)
+# - pxz (parallel xz)
 
 use strict;
 use warnings;
@@ -56,12 +56,12 @@ my %conf = (
 	'notify_zabbix' => 1,
 	'compress' => 0, # 0 - no compression; 1 - qpress (internal xtrabackup compression); 2 - gzip; 3 - bzip2; 4 - xz
 	'check_mountpoint' => 0,
-	'lock_file_expired' => 129600, # seconds
+	'lock_file_expiration' => 129600, # seconds
 	'initial_sleep' => 1800, # seconds
 
-	'parallel' => 1, # number of threads to use for parallel datafiles transfer, does not have any effect in the stream mode.
+	'parallel' => 1, # number of threads to use for parallel datafiles transfer, does not have any effect in the stream mode
 	'compress-threads' => 1, # number of threads for parallel data compression (qpress)
-	'stream' => 0, # 0 - no stream, better suitable for local backup, 1 - stream compression, better suitable for remote (eg. sshfs) backups
+	'stream' => 1, # 0 - no stream compression, better suitable for local backup, 1 - stream compression, local and remote (eg. sshfs) backups
 );
 
 my $timestamp_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime);
@@ -127,7 +127,7 @@ sub check_mountpoint {
 sub lock {
 	if (-e $conf{'lock_file'}) {
 		my $mtime = (stat ($conf{'lock_file'}))[9];
-		if (time () - $mtime > $conf{'lock_file_expired'}) {
+		if (time () - $mtime > $conf{'lock_file_expiration'}) {
 			write_log ("WARNING: lock file $conf{'lock_file'} expired, ignoring");
 			system ("touch $conf{'lock_file'}");
 		}
@@ -220,7 +220,7 @@ sub mark_items {
 sub unmark_multiple_long_term_backups {
 	my $items = shift;
 
-	# if there is more than one backup from day $conf{'long_term_backup_day'} choose first - only one long term backup per day
+	# if there is more than one backup from a day period $conf{'long_term_backup_day'} choose only first - only one long term backup per day
 	my $tmp = 0;
 	foreach my $item (sort {$items->{$a}->{'timestamp'} <=> $items->{$b}->{'timestamp'}} keys ($items)) {
 		next if (!defined ($items->{$item}->{'long_term_backup'}));
@@ -342,15 +342,15 @@ sub make_xtrabackup {
 	}
 	elsif ($conf{'compress'} == 2 && $conf{'stream'}) {
 		$backup_product = "${current_backup_dir}.tar.gz";
-		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | gzip - > $backup_product";
+		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | pigz - > $backup_product";
 	}
 	elsif ($conf{'compress'} == 3 && $conf{'stream'}) {
 		$backup_product = "${current_backup_dir}.tar.bz2";
-		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | bzip2 - > $backup_product";
+		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | lbzip2 - > $backup_product";
 	}
 	elsif ($conf{'compress'} == 4 && $conf{'stream'}) {
 		$backup_product = "${current_backup_dir}.tar.xz";
-		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | xz - > $backup_product";
+		$opts = $opts . "--stream=tar ./ 2> >(tee -a $conf{'logfile'} $tmp_logfile >/dev/null) | pxz - > $backup_product";
 	}
 	else {
 		write_log ("ERROR: wrong compress method");
@@ -377,7 +377,7 @@ sub make_xtrabackup {
 				$taropts = "cvpf ${current_backup_dir}.tar.bz2 -I lbzip2 "
 			}
 			elsif ($conf{'compress'} == 4) {
-				$taropts = "cvpf ${current_backup_dir}.tar.xz -I pixz "
+				$taropts = "cvpf ${current_backup_dir}.tar.xz -I pxz "
 			}
 			else {
 				write_log ("ERROR: wrong compress method");
@@ -515,7 +515,7 @@ if (-t 1) {
 	write_log ("INFO: backup start, interactive executing");
 }
 else {
-	init_sleep ($conf{'initial_sleep'});
+	init_sleep ($conf{'initial_sleep'}) if ($conf{'initial_sleep'});
 	write_log ("INFO: backup start");
 }
 
