@@ -180,7 +180,7 @@ sub send_influxdb_annotation {
 
 	my $ua = LWP::UserAgent->new;
 	my $req = HTTP::Request->new(POST => $conf{'influxdb_url'}.'/write?db='.$conf{'influxdb_database'});
-	$req->content($conf{'influxdb_measurement'}.',host='.$hostname.' text="backup mysql '.$state.'"');
+	$req->content($conf{'influxdb_measurement'}.',host='.$hostname.' title="backup mysql '.$state.'"');
 	my $res = $ua->request($req);
 
 	if ($res->is_success) {
