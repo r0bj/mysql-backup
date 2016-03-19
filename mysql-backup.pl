@@ -27,6 +27,7 @@ use Sys::Hostname;
 use Time::Local;
 use Config::Simple;
 use File::Temp ':mktemp';
+use LWP::UserAgent;
 
 use constant {
 	SUCCESS => '1',
@@ -47,17 +48,20 @@ my %conf = (
 	'my_cnf' => '', # if empty use default /etc/mysql/my.cnf
 	'mysql_user' => '',
 	'mysql_passwd' => '',
+	'influxdb_url' => '',
+	'influxdb_database' => '',
+	'influxdb_measurement' => '',
 
 	'backup_retention' => 7, # days
 	'long_term_backups' => 3, # items
 	'long_term_backup_day' => '01',
-	'min_backups' => 5, # minimum number of backups - do not remove backups if there are less than min_backups even if they are outdated
+	'min_backups' => 3, # minimum number of backups - do not remove backups if there are less than min_backups even if they are outdated
 	'max_backups' => 30, # maximum number of backups without long term backups; 0 - unlimited
 	'notify_zabbix' => 1,
 	'compress' => 0, # 0 - no compression; 1 - qpress (internal xtrabackup compression); 2 - gzip; 3 - bzip2; 4 - xz
 	'check_mountpoint' => 0,
 	'lock_file_expiration' => 129600, # seconds
-	'initial_sleep' => 1800, # seconds
+	'initial_sleep' => 600, # seconds
 
 	'parallel' => 1, # number of threads to use for parallel datafiles transfer, does not have any effect in the stream mode
 	'compress-threads' => 1, # number of threads for parallel data compression (qpress)
@@ -68,6 +72,7 @@ my $start_timestamp_str;
 my $start_timestamp;
 my $hostname = hostname ();
 my ($tmpfile_fh, $tmp_logfile) = mkstemp ('/tmp/mysql-backup.XXXXXX');
+my $influxdb_annotation;
 
 $SIG{'TERM'} = \&sig_handler;
 $SIG{'INT'} = \&sig_handler;
@@ -76,6 +81,7 @@ sub sig_handler {
 	write_log ('TERM/INT signal caught, exiting');
 	cleanup ();
 	unlink ($tmp_logfile);
+	send_influxdb_annotation('interrupted') if $influxdb_annotation;
 	unlock ();
 	exit 1;
 }
@@ -169,6 +175,22 @@ sub notify_zabbix {
 	write_log ("INFO: zabbix key: $zabbix_key, zabbix_sender: " . $output);
 }
 
+sub send_influxdb_annotation {
+	my $state = shift;
+
+	my $ua = LWP::UserAgent->new;
+	my $req = HTTP::Request->new(POST => $conf{'influxdb_url'}.'/write?db='.$conf{'influxdb_database'});
+	$req->content($conf{'influxdb_measurement'}.',host='.$hostname.' text="backup mysql '.$state.'"');
+	my $res = $ua->request($req);
+
+	if ($res->is_success) {
+		write_log ("INFO: sending influxdb annotation success");
+	}
+	else {
+		write_log ("WARNING: sending influxdb annotation failed: ".$res->code);
+	}
+}
+
 sub get_items_from_backup_root {
 	my $backup_root = shift;
 	my $items;
@@ -200,7 +222,7 @@ sub mark_items {
 
 	# mark backups as "do not delete" due to "store minimum number of backups"
 	my $ctr = 1;
-	foreach my $item (sort { $items->{$b}->{'timestamp'} <=> $items->{$a}->{'timestamp'} } keys ($items)) {
+	foreach my $item (sort { $items->{$b}->{'timestamp'} <=> $items->{$a}->{'timestamp'} } keys (%$items)) {
 		if ($item =~ /^$start_timestamp_str/) {
 			$items->{$item}->{'current'} = 1;
 		} 
@@ -222,7 +244,7 @@ sub unmark_multiple_long_term_backups {
 
 	# if there is more than one backup from a day period $conf{'long_term_backup_day'} choose only first - only one long term backup per day
 	my $tmp = 0;
-	foreach my $item (sort {$items->{$a}->{'timestamp'} <=> $items->{$b}->{'timestamp'}} keys ($items)) {
+	foreach my $item (sort {$items->{$a}->{'timestamp'} <=> $items->{$b}->{'timestamp'}} keys (%$items)) {
 		next if (!defined ($items->{$item}->{'long_term_backup'}));
 		# remove 'long_term_backup' key
 		if ($tmp eq $items->{$item}->{'long_term_backup'}) {
@@ -275,7 +297,7 @@ sub rm_long_term_backups {
 
 	# deleting long term backups
 	my $ctr = 1;
-	foreach my $item (sort { $items->{$b}->{'timestamp'} <=> $items->{$a}->{'timestamp'} } keys ($items)) {
+	foreach my $item (sort { $items->{$b}->{'timestamp'} <=> $items->{$a}->{'timestamp'} } keys (%$items)) {
 		if (defined ($items->{$item}->{'long_term_backup'})) {
 			if (!defined ($items->{$item}->{'current'}) && $ctr > $long_term_backups) {
 				write_log ("INFO: deleting old long term backup $item");
@@ -435,8 +457,8 @@ sub make_xtrabackup {
 
 sub parse_config {
 	my $cnf_file;
-	if (-e '/etc/backups/mysql-backup.conf') {
-		$cnf_file = '/etc/backups/mysql-backup.conf';
+	if (-e '/etc/backup/mysql-backup.conf') {
+		$cnf_file = '/etc/backup/mysql-backup.conf';
 	}
 	elsif (-e '/matrix/mysql-backup.conf') {
 		$cnf_file = '/matrix/mysql-backup.conf';
@@ -504,12 +526,14 @@ if (!length ($conf{'client_auth_file'}) && (!length ($conf{'mysql_user'}) || !le
 	exit 1;
 }
 
+if (length ($conf{'influxdb_url'}) && length ($conf{'influxdb_database'}) && length ($conf{'influxdb_measurement'})) {
+	$influxdb_annotation = 1;
+}
+
 # short hostname
 if ($hostname =~ /^([^\.]+)\./) {
 	$hostname = $1;
 }
-
-lock ();
 
 if (-t 1) {
 	write_log ("INFO: backup start, interactive executing");
@@ -519,9 +543,13 @@ else {
 	write_log ("INFO: backup start");
 }
 
+lock ();
 $start_timestamp = time ();
 $start_timestamp_str = strftime ("%Y-%m-%d_%H-%M-%S", localtime ($start_timestamp));
+send_influxdb_annotation('start') if $influxdb_annotation;
+
 make_xtrabackup ($conf{'backup_root'}.$start_timestamp_str);
 
+send_influxdb_annotation('stop') if $influxdb_annotation;
 cleanup ();
 unlock ();
