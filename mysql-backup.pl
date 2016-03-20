@@ -51,6 +51,7 @@ my %conf = (
 	'influxdb_url' => '',
 	'influxdb_database' => '',
 	'influxdb_measurement' => '',
+	'influxdb_connection_timeout' => 10,
 
 	'backup_retention' => 7, # days
 	'long_term_backups' => 3, # items
@@ -178,16 +179,29 @@ sub notify_zabbix {
 sub send_influxdb_annotation {
 	my $state = shift;
 
-	my $ua = LWP::UserAgent->new;
+	my $ua = LWP::UserAgent->new(use_eval => 0);
+	$ua->timeout($conf{'influxdb_connection_timeout'});
 	my $req = HTTP::Request->new(POST => $conf{'influxdb_url'}.'/write?db='.$conf{'influxdb_database'});
 	$req->content($conf{'influxdb_measurement'}.',host='.$hostname.' title="backup mysql '.$state.'"');
-	my $res = $ua->request($req);
 
-	if ($res->is_success) {
-		write_log ("INFO: sending influxdb annotation success");
+	my $res;
+	eval {
+		local $SIG{ALRM} = sub { die "timeout"; };
+		alarm($conf{'influxdb_connection_timeout'});
+		$res = $ua->request($req);
+		alarm(0);
+	};
+
+	if ($@ =~ /timeout/) {
+		write_log ("WARNING: sending influxdb annotation timeout");
 	}
 	else {
-		write_log ("WARNING: sending influxdb annotation failed: ".$res->code);
+		if ($res->is_success) {
+			write_log ("INFO: sending influxdb annotation success");
+		}
+		else {
+			write_log ("WARNING: sending influxdb annotation failed: ".$res->code);
+		}
 	}
 }
 
