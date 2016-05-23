@@ -403,7 +403,7 @@ sub make_xtrabackup {
 	system ("bash -c '$cmd'");
 
 	my $result = join '', <$tmpfile_fh>;
-	if ($result =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+innobackupex: completed OK!/) {
+	if ($result =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+innobackupex: completed OK!/ || $result =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+completed OK!/) {
 		if ($conf{'stream'} == 0 && $conf{'compress'} > 1) {
 			my $taropts;
 			if ($conf{'compress'} == 2) {
