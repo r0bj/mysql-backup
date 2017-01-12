@@ -48,6 +48,7 @@ my %conf = (
 	'my_cnf' => '', # if empty use default /etc/mysql/my.cnf
 	'mysql_user' => '',
 	'mysql_passwd' => '',
+	'mysql_host' => '127.0.0.1',
 	'influxdb_url' => '',
 	'influxdb_database' => '',
 	'influxdb_measurement' => '',
@@ -362,7 +363,14 @@ sub make_xtrabackup {
 	my $cmd;
 	my $output;
 	my $backup_product;
-	my $opts = $conf{'client_auth_file'} ? "--defaults-extra-file=$conf{'client_auth_file'} " : "--user=$conf{'mysql_user'} --password=$conf{'mysql_passwd'} ";
+	my $opts;
+
+	if (length ($conf{'mysql_user'}) && length ($conf{'mysql_passwd'})) {
+		$opts = "--user=$conf{'mysql_user'} --password=$conf{'mysql_passwd'} --host=$conf{'mysql_host'} ";
+	}
+	else {
+		$opts = "--defaults-extra-file=$conf{'client_auth_file'} "
+	}
 
 	$opts = $opts . ($conf{'parallel'} != 1 ? "--parallel=$conf{'parallel'} " : '') .
 		($conf{'compress-threads'} != 1 ? "--compress-threads=$conf{'compress-threads'} " : '') .
