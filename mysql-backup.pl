@@ -53,6 +53,9 @@ my %conf = (
 	'influxdb_database' => '',
 	'influxdb_measurement' => '',
 	'influxdb_connection_timeout' => 10,
+	'pushgateway_url' => '',
+	'pushgateway_connection_timeout' => 10,
+	'prometheus_job' => 'mysql-backup',
 
 	'backup_retention' => 7, # days
 	'long_term_backups' => 3, # items
@@ -202,6 +205,61 @@ sub send_influxdb_annotation {
 		}
 		else {
 			write_log ("WARNING: sending influxdb annotation failed: ".$res->code);
+		}
+	}
+}
+
+sub send_pushgateway_metrics {
+	my $state = shift;
+	my $job = shift;
+	my $duration = shift;
+
+	my $ua = LWP::UserAgent->new(use_eval => 0);
+	$ua->timeout($conf{'pushgateway_connection_timeout'});
+	my $req = HTTP::Request->new(POST => $conf{'pushgateway_url'}.'/metrics/job/'.$job.'/instance/'.$hostname);
+
+	my $timestamp = time ();
+	if ($state eq 'success') {
+		my $content = <<"END_MESSAGE";
+# HELP mysql_backup_duration_seconds Duration of mysql backup
+# TYPE mysql_backup_duration_seconds gauge
+mysql_backup_duration_seconds{mysql_host="$conf{'mysql_host'}"} $duration
+# HELP mysql_backup_last_success_timestamp_seconds Unixtime mysql backup last succeeded
+# TYPE mysql_backup_last_success_timestamp_seconds gauge
+mysql_backup_last_success_timestamp_seconds{mysql_host="$conf{'mysql_host'}"} $timestamp
+# HELP mysql_backup_last_success Success of mysql backup
+# TYPE mysql_backup_last_success gauge
+mysql_backup_last_success{mysql_host="$conf{'mysql_host'}"} 1
+END_MESSAGE
+
+		$req->content($content);
+	}
+	elsif ($state eq 'fail') {
+		my $content = <<"END_MESSAGE";
+# HELP mysql_backup_last_success Success of mysql backup
+# TYPE mysql_backup_last_success gauge
+mysql_backup_last_success{mysql_host="$conf{'mysql_host'}"} 0
+END_MESSAGE
+		$req->content($content);
+	}
+
+	my $res;
+	eval {
+		local $SIG{ALRM} = sub { die "timeout"; };
+		alarm($conf{'pushgateway_connection_timeout'});
+		$res = $ua->request($req);
+		alarm(0);
+	};
+
+	if ($@ =~ /timeout/) {
+		write_log ("WARNING: sending pushgateway metrics timeout");
+	}
+	else {
+		if ($res->is_success) {
+			write_log ("INFO: sending pushgateway metrics success");
+		}
+		else {
+			write_log ("WARNING: sending pushgateway metrics failed: ".$res->code);
 		}
 	}
 }
@@ -410,6 +468,7 @@ sub make_xtrabackup {
 	# to execute bash instead of default sh
 	system ("bash -c '$cmd'");
 
+	my $success = 0;
 	my $result = join '', <$tmpfile_fh>;
 	if ($result =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+innobackupex: completed OK!/ || $result =~ /\d{6}\s+\d{2}:\d{2}:\d{2}\s+completed OK!/) {
 		if ($conf{'stream'} == 0 && $conf{'compress'} > 1) {
@@ -434,35 +493,29 @@ sub make_xtrabackup {
 				write_log ("INFO: compression ok, deleting current backup dir $current_backup_dir");
 				if (system ("rm -rf $current_backup_dir 2>&1 >>$conf{'logfile'}") == 0) {
 					if (delete_old_backups ($conf{'backup_root'}, $conf{'backup_retention'}, $conf{'long_term_backups'})) {
-						notify_zabbix ($conf{'zabbix_key'}, SUCCESS) if ($conf{'notify_zabbix'});
-						my $duration = time () - $start_timestamp;
-						notify_zabbix ($conf{'zabbix_key_duration'}, $duration) if ($conf{'notify_zabbix'});
-						write_log ('INFO: backup duration: '.sec_to_human ($duration));
+						$success = 1;
 					}
 					else {
-						notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+						$success = 0;
 					}
 				}
 				else {
+					$success = 0;
 					write_log ("ERROR: cannot delete $current_backup_dir");
-					notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
 				}
 			}
 			else {
+				$success = 0;
 				write_log ("ERROR: cannot compress $current_backup_dir");
-				notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
 			}
 
 		}
 		else {
 			if (delete_old_backups ($conf{'backup_root'}, $conf{'backup_retention'}, $conf{'long_term_backups'})) {
-				notify_zabbix ($conf{'zabbix_key'}, SUCCESS) if ($conf{'notify_zabbix'});
-				my $duration = time () - $start_timestamp;
-				notify_zabbix ($conf{'zabbix_key_duration'}, $duration) if ($conf{'notify_zabbix'});
-				write_log ('INFO: backup duration: '.sec_to_human ($duration));
+				$success = 1;
 			}
 			else {
-				notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+				$success = 0;
 			}
 		}
 	}
@@ -471,7 +524,19 @@ sub make_xtrabackup {
 		if (system ("rm -rf $backup_product 2>&1 >>$conf{'logfile'}") != 0) {
 			write_log ("ERROR: cannot delete failed backup $backup_product");
 		}
+		$success = 0;
+	}
+
+	if ($success) {
+		my $duration = time () - $start_timestamp;
+		write_log ('INFO: backup duration: '.sec_to_human ($duration));
+		notify_zabbix ($conf{'zabbix_key'}, SUCCESS) if ($conf{'notify_zabbix'});
+		notify_zabbix ($conf{'zabbix_key_duration'}, $duration) if ($conf{'notify_zabbix'});
+		send_pushgateway_metrics ('success', $conf{'prometheus_job'}, $duration) if ($conf{'pushgateway_url'});
+	}
+	else {
 		notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+		send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	}
 
 	unlink ($tmp_logfile);
@@ -504,47 +569,55 @@ parse_config ();
 
 if ($conf{'notify_zabbix'} && (!length ($conf{'zabbix_server'}) && ! -e $conf{'zabbix_agentd_conf'})) {
 	write_log ("ERROR: zabbix_server not defined and zabbix_agentd_conf does not exists");
+	send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	exit 1;
 }
 
 if ($conf{'notify_zabbix'} && (! -e $conf{'zabbix_sender'})) {
 	write_log ("ERROR: zabbix_sender $conf{'zabbix_sender'} does not exists");
+	send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	exit 1;
 }
 
 if ($> != 0) {
 	print ("ERROR: you must be root to run this program\n");
 	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	exit 1;
 }
 
 if (! -e $conf{'innobackupex'}) {
 	write_log ("ERROR: $conf{'innobackupex'} does not exists");
 	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	exit 1;
 }
 
 if (! -d $conf{'backup_root'}) {
 	write_log ("ERROR: backup root directory $conf{'backup_root'} does not exists");
 	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	exit 1;
 }
 
 if ($conf{'check_mountpoint'} && !check_mountpoint ($conf{'backup_root'})) {
 	write_log ("ERROR: mount point for $conf{'backup_root'} does not exists");
 	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	exit 1;
 }
 
 if ($conf{'min_backups'} >= $conf{'max_backups'}) {
 	write_log ("ERROR: min_backups >= max_backups");
 	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	exit 1;
 }
 
 if (!length ($conf{'client_auth_file'}) && (!length ($conf{'mysql_user'}) || !length ($conf{'mysql_passwd'}))) {
 	write_log ('ERROR: cannot find valid mysql credentials');
 	notify_zabbix ($conf{'zabbix_key'}, FAIL) if ($conf{'notify_zabbix'});
+	send_pushgateway_metrics ('fail', $conf{'prometheus_job'}, 0) if ($conf{'pushgateway_url'});
 	exit 1;
 }
 
